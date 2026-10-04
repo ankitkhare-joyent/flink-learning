@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "Ec2StateChange",
+  "namespace": "com.example.inventory.ec2",
+  "doc": "One EC2 instance state transition, normalized from the EventBridge 'EC2 Instance State-change Notification'. Kafka key = instance_id, so all events for one instance stay in order on one partition.",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "EventBridge event id; unique per event, used for de-duplication"},
+    {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "When AWS says the transition happened (UTC). Event time."},
+    {"name": "account_id", "type": "string"},
+    {"name": "region", "type": "string"},
+    {"name": "instance_id", "type": "string"},
+    {"name": "state", "type": "string", "doc": "pending | running | stopping | stopped | shutting-down | terminated"},
+    {"name": "ingest_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "When the bridge wrote this record to Kafka (UTC). Processing time at the edge."},
+    {"name": "source", "type": "string", "default": "aws.ec2", "doc": "Origin of the event (EventBridge 'source')"},
+    {"name": "trace_id", "type": ["null", "string"], "default": null, "doc": "SQS message id, kept for end-to-end tracing"}
+  ]
+}

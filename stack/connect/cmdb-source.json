@@ -1,0 +1,30 @@
+{
+  "name": "cmdb-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/run/secrets/debezium.properties:password}",
+    "database.dbname": "cmdb",
+    "topic.prefix": "cmdb",
+    "plugin.name": "pgoutput",
+    "slot.name": "dbz_cmdb",
+    "publication.name": "dbz_cmdb",
+    "publication.autocreate.mode": "disabled",
+    "table.include.list": "public.ec2_ci",
+    "snapshot.mode": "initial",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "time.precision.mode": "connect",
+    "decimal.handling.mode": "string",
+    "tombstones.on.delete": "false",
+    "heartbeat.interval.ms": "10000",
+    "topic.creation.default.replication.factor": "1",
+    "topic.creation.default.partitions": "1",
+    "topic.creation.default.cleanup.policy": "compact"
+  }
+}

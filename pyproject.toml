@@ -1,0 +1,59 @@
+[project]
+name = "ec2-streaming"
+version = "0.1.0"
+description = "Real-time EC2 inventory: SQS + Kafka + Flink + Iceberg, with MCP tools and an event-driven agent"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+# One project, several deployables. Each Docker image installs only its group:
+#   uv sync --locked --no-default-groups --group ingest
+[dependency-groups]
+common = [
+    "pydantic-settings>=2.11",
+    "structlog>=26.1",
+    "prometheus-client>=0.26",
+    "hvac>=2.4",
+]
+ingest = [
+    { include-group = "common" },
+    "confluent-kafka[avro,schemaregistry]>=2.15.1",
+    "boto3>=1.43",
+    "psycopg[binary]>=3.3.6",
+    "pyiceberg[pyarrow,pyiceberg-core]>=0.12.0",
+    "httpx>=0.28",
+]
+mcp = [
+    { include-group = "common" },
+    "mcp>=2.3.0",
+    "confluent-kafka>=2.15.1",
+    "psycopg[binary,pool]>=3.3.6",
+    "duckdb>=1.5.6",
+    "pyarrow>=25.0",
+    "httpx>=0.28",
+]
+agent = [
+    { include-group = "common" },
+    "anthropic[mcp]>=1.11.0",
+    "mcp>=2.3.0",
+    "confluent-kafka>=2.15.1",
+    "psycopg[binary]>=3.3.6",
+]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.2",
+    "ruff>=0.14",
+    { include-group = "ingest" },
+    { include-group = "mcp" },
+    { include-group = "agent" },
+]
+
+[tool.uv]
+default-groups = ["dev"]
+package = false
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

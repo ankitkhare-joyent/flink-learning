@@ -1,0 +1,404 @@
+# Streaming EC2 inventory: the 2-hourly batch pipeline, rebuilt as a real-time one.
+#
+#   EventBridge-style events -> SQS (ElasticMQ) -> sqs-bridge -> Kafka (Avro, Schema Registry)
+#   ServiceNow-style CMDB (Postgres) -> Debezium CDC -> Kafka
+#   Kafka -> Flink SQL jobs -> Iceberg (Lakekeeper + SeaweedFS), Postgres serving tables, Kafka alerts
+#   alerts -> triage agent (Claude + MCP tools) -> Kafka + Postgres
+#   OpenBao (open-source Vault) issues every credential: KV secrets, rotated and short-lived Postgres users
+#
+# Host ports all start with 1xxxx so this stack can run next to ../learn-ai-agent.
+# Secrets come from OpenBao at runtime. The few values still written below are bootstrap material that
+# OpenBao itself needs (the Postgres admin password it uses to mint users, SeaweedFS's static keys) or
+# third-party services we did not wire up (Lakekeeper). Each is marked "bootstrap" and is local-only.
+name: ec2-streaming
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  SCHEMA_REGISTRY_URL: http://schema-registry:8081
+
+x-lake-env: &lake-env
+  ICEBERG_REST_URI: http://lakekeeper:8181/catalog
+  ICEBERG_WAREHOUSE: lakehouse
+  S3_ENDPOINT: http://seaweedfs:8333
+  S3_REGION: us-east-1
+
+x-bao-env: &bao-env
+  BAO_ADDR: http://openbao:8200
+  BAO_APPROLE_DIR: /run/approle
+
+x-flink-env: &flink-env
+  # Appended to conf/config.yaml by the image's entrypoint. Each key is explained in docs/06-flink-fundamentals.md.
+  FLINK_PROPERTIES: |
+    jobmanager.rpc.address: jobmanager
+    jobmanager.memory.process.size: 1200m
+    taskmanager.memory.process.size: 2560m
+    taskmanager.numberOfTaskSlots: 6
+    parallelism.default: 2
+    state.backend.type: rocksdb
+    state.backend.incremental: true
+    execution.checkpointing.dir: s3://flink/checkpoints
+    execution.checkpointing.savepoint-dir: s3://flink/savepoints
+    execution.checkpointing.interval: 30s
+    execution.checkpointing.mode: EXACTLY_ONCE
+    execution.checkpointing.min-pause: 10s
+    execution.checkpointing.timeout: 5min
+    execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+    restart-strategy.type: exponential-delay
+    s3.endpoint: http://seaweedfs:8333
+    s3.path.style.access: true
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: 9249
+    rest.flamegraph.enabled: true
+    table.exec.source.idle-timeout: 10s
+  ENABLE_BUILT_IN_PLUGINS: flink-s3-fs-presto-2.2.1.jar   # checkpoints/savepoints on S3
+
+services:
+  # ---------------------------------------------------------------- event backbone
+  kafka:
+    image: apache/kafka:4.3.1
+    hostname: kafka
+    ports: ["19092:19092"]              # from your laptop: localhost:19092
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller        # KRaft: no ZooKeeper (removed in Kafka 4.0)
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"      # topics are created on purpose (scripts/init_streaming.py)
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1     # 3 in production
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      retries: 30
+    mem_limit: 1g
+
+  schema-registry:
+    image: ghcr.io/aiven-open/karapace:6.2.4   # Apache-2.0, Confluent Schema Registry API compatible
+    entrypoint: ["python3", "-m", "karapace"]
+    ports: ["18085:8081"]
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_ADVERTISED_HOSTNAME: schema-registry
+      KARAPACE_BOOTSTRAP_URI: kafka:9092
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_PORT: 8081
+      KARAPACE_CLIENT_ID: schema-registry-0
+      KARAPACE_GROUP_ID: schema-registry
+      KARAPACE_MASTER_ELIGIBILITY: "true"
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_LOG_LEVEL: WARNING
+    depends_on:
+      kafka: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/subjects')"]
+      interval: 5s
+      retries: 30
+    mem_limit: 384m
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    ports: ["18080:8080"]               # http://localhost:18080 topics, messages, consumer lag, schemas, connectors
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+      JAVA_OPTS: -Xmx256m
+    depends_on:
+      kafka: { condition: service_healthy }
+    mem_limit: 512m
+
+  # ---------------------------------------------------------------- sources
+  postgres:
+    image: postgres:18-alpine
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    ports: ["15432:5432"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-local
+    volumes:
+      - pg-data:/var/lib/postgresql
+      - ./stack/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 3s
+      retries: 30
+    mem_limit: 512m
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.7.1
+    ports: ["19324:9324", "19325:9325"] # SQS API, stats UI
+    volumes: [./stack/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro]
+    mem_limit: 256m
+
+  connect:
+    image: quay.io/debezium/connect:3.7.0.Final
+    ports: ["18083:8083"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-cluster
+      CONFIG_STORAGE_TOPIC: _connect-configs
+      OFFSET_STORAGE_TOPIC: _connect-offsets
+      STATUS_STORAGE_TOPIC: _connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      HEAP_OPTS: -Xms256m -Xmx640m
+      # Secrets are resolved by Kafka Connect's FileConfigProvider, so they never appear in the connector config API.
+      CONNECT_CONFIG_PROVIDERS: file
+      CONNECT_CONFIG_PROVIDERS_FILE_CLASS: org.apache.kafka.common.config.provider.FileConfigProvider
+    volumes: [bao-rendered:/run/secrets:ro]   # debezium.properties, rendered by bao-agent
+    depends_on:
+      kafka: { condition: service_healthy }
+      bao-agent: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      retries: 40
+    mem_limit: 1g
+
+  # ---------------------------------------------------------------- secrets (OpenBao = open-source Vault)
+  openbao:
+    image: openbao/openbao:2.7.1
+    command: ["server"]
+    cap_add: [IPC_LOCK]
+    ports: ["18200:8200"]               # UI: http://localhost:18200/ui  (root token: see docs/09)
+    volumes:
+      - ./stack/openbao/server.hcl:/openbao/config/server.hcl:ro
+      - bao-data:/openbao/file
+    healthcheck:   # reachable is enough here; bao-bootstrap unseals it
+      test: ["CMD-SHELL", "BAO_ADDR=http://127.0.0.1:8200 bao status >/dev/null 2>&1; [ $$? -ne 1 ]"]
+      interval: 3s
+      retries: 30
+    mem_limit: 256m
+
+  # Init (first run), unseal (every run), engines, policies, AppRoles. Idempotent.
+  bao-bootstrap:
+    build: { context: ., args: { GROUP: ingest } }
+    image: ec2-streaming/ingest:dev
+    command: ["python", "-m", "scripts.bao_bootstrap"]
+    env_file: [{ path: .env, required: false }]   # ANTHROPIC_API_KEY, copied into OpenBao KV
+    user: "0"                                      # writes the approle files that other containers read
+    environment:
+      BAO_ADDR: http://openbao:8200
+      PG_ADMIN_PASSWORD: postgres-local            # bootstrap: OpenBao uses it to create/rotate users
+      S3_ACCESS_KEY: s3admin                       # bootstrap: must match stack/seaweedfs/iam.json
+      S3_SECRET_KEY: s3admin-local-secret
+    volumes: [bao-init:/bao-init, bao-approle:/bao-approle]
+    depends_on:
+      openbao: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+
+  # Sidecar that renders secret files for apps that cannot talk to OpenBao (Kafka Connect, Flink).
+  bao-agent:
+    image: openbao/openbao:2.7.1
+    entrypoint: ["bao", "agent", "-config=/etc/bao/agent.hcl"]
+    user: "0"   # local: lets it write the shared named volume. Kubernetes: a per-pod emptyDir (medium: Memory)
+    volumes:
+      - ./stack/openbao/agent.hcl:/etc/bao/agent.hcl:ro
+      - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: bao-agent } }
+      - bao-rendered:/rendered
+    depends_on:
+      bao-bootstrap: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /rendered/debezium.properties && test -s /rendered/flink-jobs.env"]
+      interval: 3s
+      retries: 40
+    restart: unless-stopped
+    mem_limit: 128m
+
+  # ---------------------------------------------------------------- lakehouse (same as ../learn-ai-agent)
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: ["mini", "-dir=/data", "-s3.config=/etc/seaweedfs/iam.json"]
+    ports: ["19000:8333"]
+    volumes:
+      - s3-data:/data
+      - ./stack/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status || exit 1"]
+      interval: 5s
+      retries: 30
+    mem_limit: 1g
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["migrate"]
+    environment: &lakekeeper-env
+      # bootstrap: Lakekeeper is not wired to OpenBao here (on Kubernetes: External Secrets Operator)
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres-local@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres-local@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: local-dev-only-not-a-real-secret
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["serve"]
+    environment: *lakekeeper-env
+    ports: ["18181:8181"]               # Iceberg REST: /catalog   UI: /ui
+    depends_on:
+      lakekeeper-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      retries: 30
+    mem_limit: 512m
+
+  # ---------------------------------------------------------------- stream processing
+  jobmanager:
+    build: { context: ., dockerfile: stack/flink/Dockerfile }
+    image: ec2-streaming/flink:2.2.1
+    # Append the OpenBao-rendered S3 keys to the Flink config, then start normally.
+    command: ["bash", "-c", "export FLINK_PROPERTIES=\"$${FLINK_PROPERTIES}$$(cat /run/secrets/flink-s3.yaml)\"; exec /docker-entrypoint.sh jobmanager"]
+    ports: ["18081:8081"]               # Flink Web UI + REST API
+    restart: unless-stopped
+    environment: *flink-env
+    volumes: [bao-rendered:/run/secrets:ro]
+    depends_on:
+      seaweedfs: { condition: service_healthy }
+      bao-agent: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8081/overview >/dev/null"]
+      interval: 5s
+      retries: 40
+    mem_limit: 1300m
+
+  taskmanager:
+    image: ec2-streaming/flink:2.2.1
+    command: ["bash", "-c", "export FLINK_PROPERTIES=\"$${FLINK_PROPERTIES}$$(cat /run/secrets/flink-s3.yaml)\"; exec /docker-entrypoint.sh taskmanager"]
+    environment: *flink-env
+    volumes: [bao-rendered:/run/secrets:ro]
+    restart: unless-stopped
+    depends_on:
+      jobmanager: { condition: service_healthy }
+    mem_limit: 2700m
+
+  # ---------------------------------------------------------------- one-shot setup
+  # Buckets, Iceberg warehouse + namespace, Kafka topics, Avro schema, Debezium connector. Idempotent.
+  init:
+    build: { context: ., args: { GROUP: ingest } }
+    image: ec2-streaming/ingest:dev
+    command: ["python", "-m", "scripts.init_streaming"]
+    environment:
+      <<: [*kafka-env, *lake-env, *bao-env]
+      CONNECT_URL: http://connect:8083
+    volumes:
+      - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: init } }
+    depends_on:
+      kafka: { condition: service_healthy }
+      schema-registry: { condition: service_healthy }
+      connect: { condition: service_healthy }
+      seaweedfs: { condition: service_healthy }
+      lakekeeper: { condition: service_healthy }
+
+  # Submits the Flink SQL jobs (skips any already running). Re-run: docker compose run --rm submit-jobs
+  submit-jobs:
+    image: ec2-streaming/flink:2.2.1
+    entrypoint: ["bash", "/opt/flink/jobs/submit.sh"]
+    environment: *flink-env
+    volumes: [bao-rendered:/run/secrets:ro]
+    depends_on:
+      init: { condition: service_completed_successfully }
+      taskmanager: { condition: service_started }
+
+  # ---------------------------------------------------------------- producers
+  # Simulates AWS: EventBridge EC2 state-change events into SQS, and ServiceNow CMDB edits into Postgres.
+  simulator:
+    image: ec2-streaming/ingest:dev
+    command: ["python", "-m", "services.ingest.simulator"]
+    environment:
+      SQS_ENDPOINT: http://elasticmq:9324
+      SQS_QUEUE_NAME: ec2-state-change
+      <<: *bao-env
+      CMDB_HOST_DB: postgres:5432/cmdb        # user/password: OpenBao static role "app"
+      SIM_FLEET_SIZE: "2000"
+      SIM_EVENTS_PER_SECOND: "10"
+      SIM_LATE_RATE: ${SIM_LATE_RATE:-0.003}     # exercise 4: SIM_LATE_RATE=0.2 docker compose up -d simulator
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: simulator } }
+    depends_on:
+      init: { condition: service_completed_successfully }
+      elasticmq: { condition: service_started }
+    restart: unless-stopped
+    mem_limit: 256m
+
+  # SQS -> Kafka. Stateless, so it scales horizontally (several replicas share one queue).
+  sqs-bridge:
+    image: ec2-streaming/ingest:dev
+    command: ["python", "-m", "services.ingest.sqs_bridge"]
+    ports: ["19400-19401:9400"]         # Prometheus metrics, one port per replica
+    environment:
+      <<: *kafka-env
+      SQS_ENDPOINT: http://elasticmq:9324
+      SQS_QUEUE_NAME: ec2-state-change
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+    depends_on:
+      init: { condition: service_completed_successfully }
+    restart: unless-stopped
+    deploy: { replicas: 2 }
+    mem_limit: 256m
+
+  # ---------------------------------------------------------------- AI on the stream
+  mcp:
+    build: { context: ., args: { GROUP: mcp } }
+    image: ec2-streaming/mcp:dev
+    command: ["python", "-m", "services.mcp_server.server", "--transport", "http"]
+    ports: ["18002:8002"]               # MCP endpoint: http://localhost:18002/mcp
+    environment:
+      <<: [*kafka-env, *lake-env, *bao-env]
+      MCP_SERVING_HOST_DB: postgres:5432/serving   # user/password: OpenBao dynamic role "mcp-reader"
+      MCP_FLINK_URL: http://jobmanager:8081
+    volumes:
+      - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: mcp } }
+    depends_on:
+      init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz')"]
+      interval: 5s
+      retries: 30
+    mem_limit: 768m
+
+  # Event-driven agent: consumes ec2.alerts, investigates with MCP tools, writes a triage.
+  # Needs ANTHROPIC_API_KEY in .env (bao-bootstrap copies it into OpenBao). Start: docker compose --profile agent up -d
+  triage-agent:
+    build: { context: ., args: { GROUP: agent } }
+    image: ec2-streaming/agent:dev
+    profiles: ["agent"]
+    command: ["python", "-m", "services.agent.triage"]
+    environment:
+      <<: [*kafka-env, *bao-env]
+      AGENT_MCP_URL: http://mcp:8002/mcp
+      AGENT_SERVING_HOST_DB: postgres:5432/serving   # user/password: OpenBao dynamic role "agent-writer"
+    volumes:
+      - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: agent } }
+    depends_on:
+      mcp: { condition: service_healthy }
+    restart: unless-stopped
+    mem_limit: 384m
+
+volumes:
+  bao-data:
+  bao-init:
+  bao-approle:
+  bao-rendered:
+  kafka-data:
+  pg-data:
+  s3-data:

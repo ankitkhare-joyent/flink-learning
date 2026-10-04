@@ -1,0 +1,296 @@
+<title>EC2 Streaming Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Public+Sans:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: one wide topology figure (left to right = data flow), then the event trace and the secrets matrix as tables. */
+:root {
+  --bg: #f4f6f8; --fg: #17212b; --muted: #5b6875; --line: #8795a3; --panel: #ffffff;
+  --accent: #0f7b8a; --accent-ink: #ffffff; --secret: #b86e00; --secret-soft: #fff4e2; --rule: #d8dee4;
+  --display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --body: "Public Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f151b; --fg: #e3e9ef; --muted: #98a6b3; --line: #6c7a88; --panel: #18212a;
+    --accent: #3cb8c8; --accent-ink: #06181b; --secret: #f0a83c; --secret-soft: #2a2114; --rule: #2a3540; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f151b; --fg: #e3e9ef; --muted: #98a6b3; --line: #6c7a88; --panel: #18212a;
+  --accent: #3cb8c8; --accent-ink: #06181b; --secret: #f0a83c; --secret-soft: #2a2114; --rule: #2a3540; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font: 15px/1.6 var(--body); }
+main { max-width: 1220px; margin: 0 auto; padding-inline: 20px; padding-block: 32px 56px; display: grid; gap: 28px; }
+header { display: grid; gap: 8px; max-width: 72ch; }
+.eyebrow { font: 600 12px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0; }
+h1 { font: 700 clamp(28px, 4vw, 40px)/1.1 var(--display); margin: 0; text-wrap: balance; }
+h2 { font: 600 22px/1.2 var(--display); margin: 0 0 10px; text-wrap: balance; }
+p { margin: 0; }
+.lede { color: var(--muted); }
+figure { margin: 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; display: grid; gap: 12px; }
+.scroll { overflow-x: auto; }
+svg.topo { display: block; min-width: 980px; width: 100%; height: auto; color: var(--fg); font-family: var(--body); }
+figcaption { color: var(--muted); font-size: 14px; max-width: 90ch; }
+.box { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+.zone { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 2 0; }
+.zone-fill { fill: var(--bg); stroke: var(--line); stroke-width: 1.2; }
+.topic { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+.dashed { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.bao { fill: var(--secret-soft); stroke: var(--secret); stroke-width: 1.4; }
+.t-title { font: 600 13px var(--body); fill: var(--fg); }
+.t-zone { font: 700 14px var(--display); fill: var(--fg); }
+.t-sub { font: 400 11px var(--mono); fill: var(--muted); }
+.t-edge { font: 400 10.5px var(--mono); fill: var(--muted); }
+.t-bao { font: 600 12px var(--mono); fill: var(--secret); }
+.edge { fill: none; stroke: var(--fg); stroke-width: 1.3; }
+.dot { fill: var(--secret); }
+.step circle { fill: var(--accent); }
+.step text { font: 600 11px var(--mono); fill: var(--accent-ink); text-anchor: middle; dominant-baseline: central; }
+.arrowhead { fill: var(--fg); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 13px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.swatch { width: 18px; height: 18px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font: 600 11px var(--mono); display: inline-grid; place-items: center; }
+.swatch.bao { background: var(--secret); width: 12px; height: 12px; }
+section { display: grid; gap: 6px; }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--panel); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font: 600 12px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+tr:last-child td { border-bottom: 0; }
+td.n { font: 600 13px var(--mono); color: var(--accent); width: 2.5em; }
+td code, p code { font: 12.5px var(--mono); }
+.lat { font-variant-numeric: tabular-nums; white-space: nowrap; font-family: var(--mono); font-size: 13px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 28px; }
+.grid2 > section { min-width: 0; }
+</style>
+
+<main>
+  <header>
+    <p class="eyebrow">flink-learning · final architecture</p>
+    <h1>EC2 Streaming Architecture</h1>
+    <p class="lede">The 2-hourly describe-instances batch, rebuilt as a stream. Follow the numbered steps to trace one EC2 state change from AWS to an AI triage. Every credential on the way comes from OpenBao.</p>
+  </header>
+
+  <figure>
+    <div class="scroll">
+      <svg class="topo" viewBox="0 0 1180 690" role="img" aria-label="Data flows left to right: EC2 events go through SQS and a bridge into Kafka, and CMDB changes come through Debezium into Kafka. Three Flink SQL jobs write Iceberg, Postgres serving tables and an exactly-once alert topic. A triage agent consumes alerts, calls Claude and reads live data through an MCP server. OpenBao issues the credentials.">
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrowhead"/>
+          </marker>
+        </defs>
+
+        <!-- OpenBao band -->
+        <rect class="bao" x="30" y="20" width="1120" height="48" rx="8"/>
+        <text class="t-bao" x="48" y="49">OpenBao 2.7</text>
+        <text class="t-edge" x="160" y="49">AppRole logins · KV v2 · dynamic Postgres users (1 h) · rotated static roles (30 d) · Agent sidecar renders files for Connect + Flink · audit log</text>
+        <circle class="dot" cx="1132" cy="44" r="6"/>
+
+        <!-- column labels -->
+        <text class="t-sub" x="30" y="92">SOURCES</text>
+        <text class="t-sub" x="240" y="92">INGEST</text>
+        <text class="t-sub" x="950" y="92">SINKS</text>
+
+        <!-- Sources -->
+        <rect class="box" x="30" y="100" width="160" height="74" rx="6"/>
+        <text class="t-title" x="44" y="124">EC2 fleet</text>
+        <text class="t-sub" x="44" y="143">EventBridge state-change</text>
+        <text class="t-sub" x="44" y="159">events (simulator)</text>
+
+        <rect class="box" x="30" y="320" width="160" height="74" rx="6"/>
+        <text class="t-title" x="44" y="344">ServiceNow CMDB</text>
+        <text class="t-sub" x="44" y="363">Postgres cmdb.ec2_ci</text>
+        <text class="t-sub" x="44" y="379">owner · app · tier</text>
+        <circle class="dot" cx="180" cy="330" r="5"/>
+
+        <!-- Ingest -->
+        <rect class="box" x="240" y="100" width="160" height="56" rx="6"/>
+        <text class="t-title" x="254" y="123">SQS queue</text>
+        <text class="t-sub" x="254" y="142">ElasticMQ · redrive 5x</text>
+
+        <rect class="box" x="240" y="180" width="160" height="60" rx="6"/>
+        <text class="t-title" x="254" y="203">sqs-bridge ×2</text>
+        <text class="t-sub" x="254" y="222">validate · ack, then delete</text>
+
+        <rect class="box" x="240" y="320" width="160" height="74" rx="6"/>
+        <text class="t-title" x="254" y="344">Debezium</text>
+        <text class="t-sub" x="254" y="363">Kafka Connect</text>
+        <text class="t-sub" x="254" y="379">WAL · pgoutput slot</text>
+        <circle class="dot" cx="390" cy="330" r="5"/>
+
+        <!-- Kafka -->
+        <rect class="zone-fill" x="450" y="100" width="210" height="420" rx="10"/>
+        <text class="t-zone" x="465" y="124">Kafka 4.3 · KRaft</text>
+        <rect class="topic" x="465" y="140" width="180" height="40" rx="5"/>
+        <text class="t-title" x="475" y="157">ec2.state-changes</text>
+        <text class="t-sub" x="475" y="172">6 parts · Avro · key=instance</text>
+        <rect class="topic" x="465" y="192" width="180" height="40" rx="5"/>
+        <text class="t-title" x="475" y="209">ec2.state-changes.dlq</text>
+        <text class="t-sub" x="475" y="224">bad payload + reason</text>
+        <rect class="dashed" x="465" y="252" width="180" height="56" rx="5"/>
+        <text class="t-title" x="475" y="273">Schema Registry</text>
+        <text class="t-sub" x="475" y="291">Karapace · BACKWARD</text>
+        <rect class="topic" x="465" y="337" width="180" height="40" rx="5"/>
+        <text class="t-title" x="475" y="354">cmdb.public.ec2_ci</text>
+        <text class="t-sub" x="475" y="369">compacted changelog</text>
+        <rect class="topic" x="465" y="400" width="180" height="40" rx="5"/>
+        <text class="t-title" x="475" y="417">ec2.alerts</text>
+        <text class="t-sub" x="475" y="432">exactly-once · 3 parts</text>
+        <rect class="topic" x="465" y="452" width="180" height="40" rx="5"/>
+        <text class="t-title" x="475" y="469">ec2.alerts.triaged</text>
+        <text class="t-sub" x="475" y="484">+ ec2.alerts.dlq</text>
+
+        <!-- Flink -->
+        <rect class="zone-fill" x="710" y="100" width="190" height="420" rx="10"/>
+        <text class="t-zone" x="725" y="124">Flink 2.2 · SQL</text>
+        <circle class="dot" cx="888" cy="118" r="5"/>
+        <rect class="box" x="725" y="140" width="160" height="74" rx="6"/>
+        <text class="t-title" x="739" y="163">ec2-lakehouse</text>
+        <text class="t-sub" x="739" y="182">dedup · temporal join</text>
+        <text class="t-sub" x="739" y="198">CMDB as of event time</text>
+        <rect class="box" x="725" y="240" width="160" height="74" rx="6"/>
+        <text class="t-title" x="739" y="263">ec2-serving</text>
+        <text class="t-sub" x="739" y="282">OVER · Top-1 · TUMBLE</text>
+        <text class="t-sub" x="739" y="298">CMDB now (regular join)</text>
+        <rect class="box" x="725" y="340" width="160" height="74" rx="6"/>
+        <text class="t-title" x="739" y="363">ec2-alerts</text>
+        <text class="t-sub" x="739" y="382">MATCH_RECOGNIZE</text>
+        <text class="t-sub" x="739" y="398">+ tier1 terminations</text>
+        <rect class="dashed" x="725" y="440" width="160" height="60" rx="6"/>
+        <text class="t-title" x="739" y="463">checkpoints · 30 s</text>
+        <text class="t-sub" x="739" y="482">RocksDB → S3</text>
+
+        <!-- Sinks -->
+        <rect class="box" x="950" y="130" width="200" height="96" rx="6"/>
+        <text class="t-title" x="964" y="153">Iceberg lakehouse</text>
+        <text class="t-sub" x="964" y="172">state_changes_raw</text>
+        <text class="t-sub" x="964" y="188">state_changes (day part.)</text>
+        <text class="t-sub" x="964" y="207">Lakekeeper · SeaweedFS S3</text>
+        <rect class="box" x="950" y="250" width="200" height="80" rx="6"/>
+        <text class="t-title" x="964" y="273">Postgres serving</text>
+        <text class="t-sub" x="964" y="292">instance_current_state</text>
+        <text class="t-sub" x="964" y="308">counts_1m · alert_triage</text>
+
+        <!-- AI row -->
+        <text class="t-sub" x="240" y="572">AI ON THE STREAM</text>
+        <rect class="box" x="240" y="580" width="160" height="80" rx="6"/>
+        <text class="t-title" x="254" y="604">Claude Opus 5.5</text>
+        <text class="t-sub" x="254" y="623">tool runner</text>
+        <text class="t-sub" x="254" y="639">TriageResult schema</text>
+        <rect class="box" x="450" y="580" width="210" height="80" rx="6"/>
+        <text class="t-title" x="464" y="604">Triage agent</text>
+        <text class="t-sub" x="464" y="623">consumer · 20 triages/h</text>
+        <text class="t-sub" x="464" y="639">idempotent · DLQ after 3</text>
+        <circle class="dot" cx="650" cy="590" r="5"/>
+        <rect class="box" x="710" y="580" width="190" height="80" rx="6"/>
+        <text class="t-title" x="724" y="604">MCP server</text>
+        <text class="t-sub" x="724" y="623">6 read-only tools</text>
+        <text class="t-sub" x="724" y="639">bearer token · stateless</text>
+        <circle class="dot" cx="890" cy="590" r="5"/>
+        <rect class="box" x="950" y="580" width="200" height="80" rx="6"/>
+        <text class="t-title" x="964" y="604">You, in Claude Code</text>
+        <text class="t-sub" x="964" y="623">"is the pipeline healthy?"</text>
+        <text class="t-sub" x="964" y="639">same tools over HTTP</text>
+
+        <!-- Edges: ingest -->
+        <line class="edge" x1="190" y1="128" x2="238" y2="128" marker-end="url(#arr)"/>
+        <line class="edge" x1="320" y1="156" x2="320" y2="178" marker-end="url(#arr)"/>
+        <text class="t-edge" x="327" y="171">long poll</text>
+        <polyline class="edge" points="400,195 428,195 428,160 463,160" marker-end="url(#arr)"/>
+        <line class="edge" x1="400" y1="212" x2="463" y2="212" marker-end="url(#arr)"/>
+        <text class="t-edge" x="406" y="228">invalid</text>
+        <line class="edge" x1="190" y1="357" x2="238" y2="357" marker-end="url(#arr)"/>
+        <text class="t-edge" x="198" y="350">WAL</text>
+        <line class="edge" x1="400" y1="357" x2="463" y2="357" marker-end="url(#arr)"/>
+        <text class="t-edge" x="406" y="350">changes</text>
+
+        <!-- Edges: Kafka <-> Flink -->
+        <line class="edge" x1="645" y1="160" x2="723" y2="160" marker-end="url(#arr)"/>
+        <text class="t-edge" x="652" y="152">all 3 jobs</text>
+        <line class="edge" x1="645" y1="357" x2="723" y2="357" marker-end="url(#arr)"/>
+        <text class="t-edge" x="652" y="349">CMDB</text>
+        <polyline class="edge" points="725,405 690,405 690,420 647,420" marker-end="url(#arr)"/>
+        <text class="t-edge" x="652" y="452">EOS txn</text>
+
+        <!-- Edges: Flink -> sinks -->
+        <line class="edge" x1="885" y1="177" x2="948" y2="177" marker-end="url(#arr)"/>
+        <text class="t-edge" x="896" y="198">commit</text>
+        <line class="edge" x1="885" y1="285" x2="948" y2="285" marker-end="url(#arr)"/>
+        <text class="t-edge" x="896" y="306">upsert</text>
+
+        <!-- Edges: AI row -->
+        <line class="edge" x1="520" y1="520" x2="520" y2="578" marker-end="url(#arr)"/>
+        <text class="t-edge" x="512" y="553" text-anchor="end">read_committed</text>
+        <line class="edge" x1="610" y1="578" x2="610" y2="522" marker-end="url(#arr)"/>
+        <text class="t-edge" x="617" y="553">triaged</text>
+        <line class="edge" x1="448" y1="620" x2="402" y2="620" marker-start="url(#arr)" marker-end="url(#arr)"/>
+        <line class="edge" x1="660" y1="620" x2="708" y2="620" marker-end="url(#arr)"/>
+        <line class="edge" x1="950" y1="620" x2="902" y2="620" marker-end="url(#arr)"/>
+        <line class="edge" x1="790" y1="580" x2="790" y2="522" marker-end="url(#arr)"/>
+        <text class="t-edge" x="797" y="553">health</text>
+        <polyline class="edge" points="870,580 870,545 1050,545 1050,332" marker-end="url(#arr)"/>
+        <text class="t-edge" x="1058" y="440">SELECT +</text>
+        <text class="t-edge" x="1058" y="455">DuckDB</text>
+        <text class="t-edge" x="1058" y="470">(Iceberg)</text>
+
+        <!-- Numbered trace -->
+        <g class="step"><circle cx="214" cy="128" r="9"/><text x="214" y="128">1</text></g>
+        <g class="step"><circle cx="428" cy="178" r="9"/><text x="428" y="178">2</text></g>
+        <g class="step"><circle cx="684" cy="160" r="9"/><text x="684" y="160">3</text></g>
+        <g class="step"><circle cx="917" cy="177" r="9"/><text x="917" y="177">4</text></g>
+        <g class="step"><circle cx="917" cy="285" r="9"/><text x="917" y="285">5</text></g>
+        <g class="step"><circle cx="690" cy="412" r="9"/><text x="690" y="412">6</text></g>
+        <g class="step"><circle cx="520" cy="566" r="9"/><text x="520" y="566">7</text></g>
+        <g class="step"><circle cx="684" cy="620" r="9"/><text x="684" y="620">8</text></g>
+        <g class="step"><circle cx="425" cy="620" r="9"/><text x="425" y="620">9</text></g>
+      </svg>
+    </div>
+    <div class="legend">
+      <span><i class="swatch">1</i>Numbered steps trace one event (table below)</span>
+      <span><i class="swatch bao"></i>Gets its credentials from OpenBao</span>
+      <span>Dashed box: supporting service or state, not on the data path</span>
+    </div>
+    <figcaption>Left to right is the direction data flows. Kafka is the shared backbone: sources write to it once, and the Flink jobs, the lakehouse and the agent each read it at their own pace. The agent only ever sees what Flink has materialized, through read-only MCP tools.</figcaption>
+  </figure>
+
+  <div class="grid2">
+    <section>
+      <h2>One EC2 stop, step by step</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>#</th><th>What happens</th><th>Latency</th></tr></thead>
+          <tbody>
+            <tr><td class="n">1</td><td>AWS emits the state change; EventBridge delivers it to SQS.</td><td class="lat">&lt; 1 s</td></tr>
+            <tr><td class="n">2</td><td>The bridge validates it, writes Avro keyed by <code>instance_id</code> with <code>acks=all</code>, then deletes it from SQS. At-least-once.</td><td class="lat">&lt; 1 s</td></tr>
+            <tr><td class="n">3</td><td>All three Flink jobs read it. Duplicates are dropped on <code>event_id</code>; the watermark trails event time by 30 s.</td><td class="lat">ms</td></tr>
+            <tr><td class="n">4</td><td>Joined with the CMDB row valid at event time and committed to Iceberg on the next checkpoint.</td><td class="lat">30–60 s</td></tr>
+            <tr><td class="n">5</td><td>Upserted into <code>instance_current_state</code> with the current owner and the hour's transition count.</td><td class="lat">1–2 s</td></tr>
+            <tr><td class="n">6</td><td>The third stop/start cycle within 10 minutes completes the pattern, and the alert is published in a Kafka transaction.</td><td class="lat">30–60 s</td></tr>
+            <tr><td class="n">7</td><td>The triage agent reads only committed alerts and skips stale or already-triaged ones.</td><td class="lat">ms</td></tr>
+            <tr><td class="n">8</td><td>It investigates through MCP: pipeline health, current state, Iceberg timeline, fleet activity.</td><td class="lat">seconds</td></tr>
+            <tr><td class="n">9</td><td>Claude returns a structured triage, written to Postgres and <code>ec2.alerts.triaged</code>; then the offset is committed.</td><td class="lat">~30 s</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Who gets which secret</h2>
+      <div class="tablewrap">
+        <table>
+          <thead><tr><th>Component</th><th>From OpenBao</th><th>Kind</th></tr></thead>
+          <tbody>
+            <tr><td>Debezium (via Agent file)</td><td><code>database/static-creds/debezium</code></td><td>rotated every 30 d</td></tr>
+            <tr><td>Flink jobs (via Agent file)</td><td><code>static-creds/flink</code>, S3 keys</td><td>rotated + KV</td></tr>
+            <tr><td>Simulator</td><td><code>static-creds/app</code></td><td>rotated every 30 d</td></tr>
+            <tr><td>MCP server</td><td><code>database/creds/mcp-reader</code>, MCP token</td><td>new user per hour, SELECT only</td></tr>
+            <tr><td>Triage agent</td><td><code>creds/agent-writer</code>, Anthropic key, MCP token</td><td>new user per hour + KV</td></tr>
+            <tr><td>sqs-bridge</td><td>nothing</td><td>IAM role on AWS</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="lede">Each service logs in with its own AppRole and can read only the paths its policy names. On EKS the same policies attach to Kubernetes service accounts instead.</p>
+    </section>
+  </div>
+</main>
