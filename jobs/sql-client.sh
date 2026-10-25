@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Interactive Flink SQL client with the session setup (catalogs, sources, views) already loaded:
-#   docker compose run --rm --no-deps --entrypoint bash submit-jobs /opt/flink/jobs/sql-client.sh
+# Flink SQL client with the session setup (catalogs, sources, views) already loaded:
+#   docker compose run --rm --no-deps --entrypoint bash submit-jobs /opt/flink/jobs/sql-client.sh          # interactive
+#   ... /opt/flink/jobs/sql-client.sh -f /lab/sql/explain.sql                                             # run a script
 set -euo pipefail
 printf '%s\nrest.address: jobmanager\n' "${FLINK_PROPERTIES:-}" >> /opt/flink/conf/config.yaml
 set -a; . /run/secrets/flink-jobs.env; set +a
@@ -10,4 +11,4 @@ cp /opt/flink/jobs/00_session.sql "$session"
 for var in SERVING_DB_USER SERVING_DB_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY PIPELINE_NAME; do
   sed -i "s|\${$var}|${!var}|g" "$session"
 done
-exec /opt/flink/bin/sql-client.sh -i "$session"
+exec /opt/flink/bin/sql-client.sh -i "$session" "$@"

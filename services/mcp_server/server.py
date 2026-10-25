@@ -43,7 +43,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from services.common.observability import configure_logging
-from services.common.secrets import DynamicDsn, load_secrets
+from services.common.secrets import DynamicDsn, is_auth_failure, load_secrets
 from services.common.topics import ALERTS, STATE_CHANGES, STATE_CHANGES_DLQ
 
 log = configure_logging("mcp")
@@ -81,11 +81,20 @@ class Backends:
         self._duck_lock = asyncio.Lock()
 
     async def sql(self, query: str, params: tuple = ()) -> list[dict]:
-        dsn = await asyncio.to_thread(self.pg.get)
-        async with await psycopg.AsyncConnection.connect(dsn, row_factory=dict_row, connect_timeout=5) as conn:
-            await conn.execute("SET statement_timeout = '5s'; SET default_transaction_read_only = on")
-            cur = await conn.execute(query, params)
-            return await cur.fetchall()
+        for attempt in (1, 2):
+            dsn = await asyncio.to_thread(self.pg.get)
+            try:
+                conn = await psycopg.AsyncConnection.connect(dsn, row_factory=dict_row, connect_timeout=5)
+            except psycopg.OperationalError as e:
+                if attempt == 1 and is_auth_failure(e):   # lease revoked: get a new user and try once more
+                    self.pg.invalidate()
+                    continue
+                raise
+            async with conn:
+                await conn.execute("SET statement_timeout = '5s'; SET default_transaction_read_only = on")
+                cur = await conn.execute(query, params)
+                return await cur.fetchall()
+        raise RuntimeError("unreachable")
 
     def _duckdb(self) -> duckdb.DuckDBPyConnection:
         if self._duck is None:

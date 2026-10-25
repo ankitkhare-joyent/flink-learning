@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from services.common.observability import Shutdown, configure_logging, start_metrics_server
-from services.common.secrets import DynamicDsn, load_secrets
+from services.common.secrets import DynamicDsn, is_auth_failure, load_secrets
 from services.common.topics import ALERTS, ALERTS_DLQ, ALERTS_TRIAGED
 
 
@@ -133,12 +133,21 @@ class TriageAgent:
         return final.parsed_output, usage
 
     # ------------------------------------------------------------------ outputs (idempotent)
+    def connect(self) -> psycopg.Connection:
+        try:
+            return psycopg.connect(self.db.get(), connect_timeout=5)
+        except psycopg.OperationalError as e:
+            if not is_auth_failure(e):
+                raise
+            self.db.invalidate()                 # lease revoked: get a new user and try once more
+            return psycopg.connect(self.db.get(), connect_timeout=5)
+
     def already_triaged(self, alert_id: str) -> bool:
-        with psycopg.connect(self.db.get(), connect_timeout=5) as c:
+        with self.connect() as c:
             return c.execute("SELECT 1 FROM alert_triage WHERE alert_id = %s", (alert_id,)).fetchone() is not None
 
     def write(self, alert: dict, result: TriageResult) -> None:
-        with psycopg.connect(self.db.get(), connect_timeout=5) as c:
+        with self.connect() as c:
             c.execute(
                 "INSERT INTO alert_triage (alert_id, instance_id, alert_type, severity, summary, likely_cause, "
                 "next_steps, notify, model) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (alert_id) DO UPDATE SET "

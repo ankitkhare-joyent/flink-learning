@@ -131,3 +131,19 @@ class DynamicDsn:
                          ttl_seconds=int(self._creds.expires_at - time.time()))
             c = self._creds
         return f"postgresql://{c.username}:{c.password}@{self.host_db}"
+
+    def invalidate(self) -> None:
+        """Forget the cached credentials, so the next get() asks OpenBao again.
+
+        Call it when Postgres rejects the password: the lease was revoked (incident response) or the user was
+        dropped. Without this, a revoked user would keep failing until its cached lease neared expiry.
+        """
+        with self._lock:
+            if self._creds is not None:
+                log.warning("database credentials rejected; fetching new ones", role=self.role,
+                            user=self._creds.username)
+            self._creds = None
+
+
+def is_auth_failure(exc: Exception) -> bool:
+    return "password authentication failed" in str(exc)

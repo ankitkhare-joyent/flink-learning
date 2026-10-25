@@ -85,6 +85,13 @@ with its latency and delivery guarantee, and [docs/architecture.html](docs/archi
 | 11 | [Operating in production](docs/11-operating-in-production.md) | Kubernetes, AWS, monitoring, upgrades, backfills |
 | 12 | [Exercises](docs/12-exercises.md) | Break things on purpose and watch the system cope |
 
+## Hands-on labs
+
+Once you've read a lesson, do its lab: [lab/README.md](lab/README.md) has nine sittings in data-flow order (OpenBao,
+SQS, Kafka, Debezium, the Flink runtime, Flink SQL semantics, the lakehouse, serving and alerts, MCP and the agent).
+In each one you predict, run, check against recorded answers, then break something on purpose and fix it. Start with
+its fresh-start sequence (`mise run reset`, then `mise run up`).
+
 ## Run it
 
 Needs Docker with about **8 GB free** for this stack (Docker Desktop: Settings > Resources > Memory; 12 GB total is

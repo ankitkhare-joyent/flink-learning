@@ -1,3 +1,72 @@
+# mise: this project's tools, environment and tasks.
+#   cd flink-learning   -> right Python + uv + bao on PATH, .venv activated
+#   mise tasks          -> list the tasks below
+
 [tools]
 python = "3.13.16"
 uv = "0.12.22"
+"github:openbao/openbao" = "2.7.1"     # the `bao` CLI, same version as the server; used by the labs
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+UV_PYTHON = "3.13.16"
+BAO_ADDR = "http://localhost:18200"     # this stack's OpenBao (other labs use other ports)
+
+[tasks.setup]
+description = "Install Python dependencies from uv.lock (host-side scripts, tests, lab helpers)"
+run = "uv sync --locked"
+
+[tasks.up]
+description = "Build and start the whole stack, then wait until the three Flink jobs are running (~4 min cold)"
+run = "docker compose up -d --build && bash lab/wait_ready.sh"
+
+[tasks.down]
+description = "Stop everything (keeps data); also stops the triage agent"
+run = "docker compose --profile agent stop"
+
+[tasks.reset]
+description = "Stop everything and DELETE all data: Kafka, Postgres, Iceberg, OpenBao (keys, root token). .env stays"
+run = "docker compose --profile agent down -v"
+
+[tasks.agent]
+description = "Start the triage agent (calls Claude; needs ANTHROPIC_API_KEY in .env, then mise run bootstrap)"
+run = "docker compose --profile agent up -d --build triage-agent"
+
+[tasks.bootstrap]
+description = "Re-run the idempotent OpenBao bootstrap (unseal, policies, copies the key from .env)"
+run = "docker compose up -d --force-recreate --no-deps bao-bootstrap"
+
+[tasks.submit]
+description = "Submit any Flink job that is not running (re-renders secrets into the SQL)"
+run = "docker compose up -d --force-recreate --no-deps submit-jobs && bash lab/wait_ready.sh"
+
+[tasks.sql]
+description = "Interactive Flink SQL client with the session (catalogs, sources, views) preloaded"
+run = "docker compose run --rm --no-deps --entrypoint bash submit-jobs /opt/flink/jobs/sql-client.sh"
+
+[tasks."lab:sql"]
+description = "Run a Flink SQL script from lab/sql/ with the session preloaded, e.g. mise run lab:sql -- changelog.sql"
+run = "bash lab/sql.sh"
+
+[tasks.test]
+description = "Unit tests (no Docker needed)"
+run = "uv run pytest -q"
+
+[tasks.lint]
+run = "uv run ruff check ."
+
+[tasks."lab:sqs"]
+description = "SQS from your laptop: depth | peek | send-junk (lab/sqs.py)"
+run = "uv run python -m lab.sqs"
+
+[tasks."lab:avro"]
+description = "Read one ec2.state-changes record raw: wire-format bytes, schema id, decoded value (lab/avro_peek.py)"
+run = "uv run python -m lab.avro_peek"
+
+[tasks."lab:duck"]
+description = "DuckDB on your laptop, attached to the Iceberg lakehouse (lab/duck.py)"
+run = "uv run python -m lab.duck"
+
+[tasks."lab:mcp"]
+description = "Talk to the MCP server like an MCP client would (lab/mcp_call.py)"
+run = "uv run python -m lab.mcp_call"

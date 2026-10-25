@@ -42,7 +42,14 @@ for job in /opt/flink/jobs/[1-9]*.sql; do
   echo "job $name: submitting $(basename "$job")"
   # Session setup + job in one script: sql-client -f stops at, and prints, the first failing statement.
   script="$WORK/run-$(basename "$job")"
-  cat "$(render /opt/flink/jobs/00_session.sql)" "$(render "$job")" > "$script"
+  cat "$(render /opt/flink/jobs/00_session.sql)" > "$script"
+  # Upgrade path: start from a savepoint or retained checkpoint instead of from scratch.
+  #   RESTORE_FROM=s3://flink/savepoints/savepoint-... mise run submit
+  if [ -n "${RESTORE_FROM:-}" ]; then
+    echo "job $name: restoring state from $RESTORE_FROM"
+    echo "SET 'execution.state-recovery.path' = '$RESTORE_FROM';" >> "$script"
+  fi
+  cat "$(render "$job")" >> "$script"
   /opt/flink/bin/sql-client.sh -f "$script" 2>&1 | tee "$WORK/out.log"
   # sql-client exits 0 even when a statement fails, so check its output.
   if grep -q "\[ERROR\]" "$WORK/out.log"; then echo "job $name: FAILED (see the error above)" >&2; failed=1; fi

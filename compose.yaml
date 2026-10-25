@@ -27,12 +27,13 @@ x-bao-env: &bao-env
   BAO_APPROLE_DIR: /run/approle
 
 x-flink-env: &flink-env
-  # Appended to conf/config.yaml by the image's entrypoint. Each key is explained in docs/06-flink-fundamentals.md.
+  # Appended to conf/config.yaml by the image's entrypoint (no comments inside: they break parsing).
+  # Each key is explained in docs/06-flink-fundamentals.md.
   FLINK_PROPERTIES: |
     jobmanager.rpc.address: jobmanager
     jobmanager.memory.process.size: 1200m
     taskmanager.memory.process.size: 2560m
-    taskmanager.numberOfTaskSlots: 6
+    taskmanager.numberOfTaskSlots: 8
     parallelism.default: 2
     state.backend.type: rocksdb
     state.backend.incremental: true
@@ -308,7 +309,9 @@ services:
   submit-jobs:
     image: ec2-streaming/flink:2.2.1
     entrypoint: ["bash", "/opt/flink/jobs/submit.sh"]
-    environment: *flink-env
+    environment:
+      <<: *flink-env
+      RESTORE_FROM: ${RESTORE_FROM:-}     # set to a savepoint path to upgrade a stopped job (lab 07)
     volumes: [bao-rendered:/run/secrets:ro]
     depends_on:
       init: { condition: service_completed_successfully }
@@ -387,6 +390,7 @@ services:
       <<: [*kafka-env, *bao-env]
       AGENT_MCP_URL: http://mcp:8002/mcp
       AGENT_SERVING_HOST_DB: postgres:5432/serving   # user/password: OpenBao dynamic role "agent-writer"
+      AGENT_TRIAGES_PER_HOUR: ${AGENT_TRIAGES_PER_HOUR:-20}   # cost cap; lab 09 uses 3
     volumes:
       - { type: volume, source: bao-approle, target: /run/approle, read_only: true, volume: { subpath: agent } }
     depends_on:

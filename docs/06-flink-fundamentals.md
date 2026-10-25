@@ -5,7 +5,7 @@
 | Spark | Flink | Here |
 |---|---|---|
 | Driver | **JobManager**: schedules, coordinates checkpoints, serves the UI/REST | `jobmanager` (http://localhost:18081) |
-| Executor | **TaskManager**: runs the operators, holds state | `taskmanager`, 6 **task slots** |
+| Executor | **TaskManager**: runs the operators, holds state | `taskmanager`, 8 **task slots** |
 | Stage / task | **Operator** / **subtask** (one per parallel instance) | `parallelism.default: 2` |
 | Shuffle between stages | **Network exchange** (hash by key, broadcast, forward) | Shown as edges in the job graph |
 | Job ends | Job runs forever | Until cancelled or upgraded |
@@ -113,7 +113,7 @@ bottleneck.
 
 | Key | Value | Why |
 |---|---|---|
-| `taskmanager.numberOfTaskSlots` | 6 | 3 jobs x parallelism 2 |
+| `taskmanager.numberOfTaskSlots` | 8 | 3 jobs x parallelism 2, plus 2 spare for ad-hoc queries |
 | `state.backend.type` / `incremental` | rocksdb / true | Large state, small checkpoints |
 | `execution.checkpointing.interval` | 30s | Latency of transactional sinks vs overhead |
 | `execution.checkpointing.mode` | EXACTLY_ONCE | Aligned barriers |
